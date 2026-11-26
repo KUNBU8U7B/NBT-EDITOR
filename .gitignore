@@ -1,0 +1,74 @@
+# ============================================================================
+# NBT Editor — .gitignore
+# Dibuat berdasarkan audit struktur project (26 Nov 2026).
+# Prinsip: yang diabaikan adalah REFERENCE MATERIAL, BUILD OUTPUT, dan CREDENTIAL.
+# Source aplikasi, aset runtime, skrip build, dokumentasi, dan VERSION tetap
+# masuk repository.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Material referensi / hasil dekompilasi XAPK (≈1.4 GB, pihak ketiga)
+#    Tidak diperlukan untuk membangun aplikasi dan berpotensi melanggar hak
+#    cipta pihak ketiga jika ikut dipublikasikan.
+# ----------------------------------------------------------------------------
+/.ref_extract/
+/xapk_extract/
+/apkbase/
+/classes7/
+/MineTuner+-+NBT+Editor_2.2.3_APKPure.xapk
+
+# World contoh / data uji (≈14 MB, bukan source project)
+/H-S.mcworld
+
+# ----------------------------------------------------------------------------
+# 2. Hasil build & artefak test (dibuat ulang oleh scripts/build_apk_host.sh)
+# ----------------------------------------------------------------------------
+/out/
+/build/
+*.o
+*.class
+*.dex
+*.apk
+*.ap_
+*.aab
+*.idsig
+*.log
+*.pyc
+*.pyo
+__pycache__/
+
+# ----------------------------------------------------------------------------
+# 3. Kunci penandatanganan & informasi sensitif
+#    out/debug.keystore sudah tercakup oleh /out/, pola ini mengunci juga
+#    keystore rilis yang mungkin dibuat kemudian di lokasi lain.
+# ----------------------------------------------------------------------------
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+
+# ----------------------------------------------------------------------------
+# 4. Screenshot/uuid dump hasil pengujian (bukan aset aplikasi)
+#    Aset aplikasi yang dipakai runtime ada di app/assets/ dan TIDAK diabaikan.
+# ----------------------------------------------------------------------------
+/screenshots/
+
+# ----------------------------------------------------------------------------
+# 5. File sementara editor / OS
+# ----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.bak
+*.tmp
+
+# ----------------------------------------------------------------------------
+# CATATAN PENTING — JANGAN menambahkan pola berikut:
+#   *.so   -> app/libs/arm64-v8a/libleveldb.so adalah dependensi build wajib
+#   *.png  -> app/assets/entityIcons/*.png, navIcons/*.png, ui/*.png adalah aset runtime
+#   *.inc  -> app/src/block_colors.inc, entity_icons.inc, font_table.inc adalah source
+#   *.md   -> DOKUMENTASI.md, ANALISIS_KODE_XAPK.md, analisis_parts/*.md adalah dokumentasi
+# ----------------------------------------------------------------------------

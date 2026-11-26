@@ -1,0 +1,11 @@
+# Sumber kebenaran versi aplikasi (dipakai scripts/build_apk_host.sh).
+# Naikkan versionCode setiap rilis (Android menolak APK dengan versionCode sama
+# dan versionName lebih rendah).
+#
+# KEBIJAKAN VERSI (instruksi user):
+# - Versi saat ini: 1.7.0. Hanya angka PATCH (ketiga) yang boleh dinaikkan:
+#   1.7.0 -> 1.7.1 -> ... -> 1.7.N (boleh sampai ribuan).
+# - JANGAN mengubah angka MINOR (kedua, saatnya 7) tanpa konfirmasi user.
+# - JANGAN naik ke 1.8.0 sebelum semua bug dinyatakan selesai oleh user.
+VERSION_CODE=27
+VERSION_NAME=1.7.6

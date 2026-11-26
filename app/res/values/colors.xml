@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Palet hijau referensi (MineTuner) -->
+    <color name="primary">#429e46</color>
+    <color name="secondary">#66bb6a</color>
+    <color name="background">#f1f8e9</color>
+    <color name="surface">#ffffff</color>
+    <color name="onPrimary">#ffffff</color>
+    <color name="error">#b00020</color>
+    <color name="navigationBar">#429e46</color>
+</resources>

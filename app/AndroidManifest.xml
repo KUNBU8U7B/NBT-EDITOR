@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nbteditor">
+
+    <!-- Akses file NBT dari penyimpanan bersama (di-request saat runtime). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="@string/app_name"
+        android:hasCode="true"
+        android:theme="@style/Theme.NbtEditor"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="false"
+        android:hardwareAccelerated="false"
+        android:requestLegacyExternalStorage="true"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:enableOnBackInvokedCallback="false">
+
+        <!-- Aktivitas native: tanpa kode Java/DEX sama sekali. -->
+        <activity
+            android:name="com.nbteditor.MainActivity"
+            android:label="@string/app_name"
+            android:exported="true"
+            android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|density"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor">
+            <meta-data android:name="android.app.lib_name" android:value="nbt" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Terima file .nbt/.dat dari aplikasi lain -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="*/*" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <!-- SAF jembatan ke file manager bawaan OS. Tidak punya UI sendiri. -->
+        <activity
+            android:name="com.nbteditor.FilePickerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|density" />
+    </application>
+</manifest>
