@@ -2,6 +2,7 @@ package com.nbteditor;
 
 import android.app.Activity;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
@@ -59,7 +60,33 @@ public class FilePickerActivity extends Activity {
 
     private int mode = MODE_IMPORT_WORLD;
     private static String sUri = "";
-    private static android.content.Context sContext = null;
+    static Context sContext = null;
+
+    /**
+     * Serahkan file .mcworld sementara (di cache privat) ke Minecraft lewat
+     * ACTION_VIEW + content Uri. Dipanggil dari native setelah zip selesai.
+     */
+    public static boolean openInMinecraft(String fileName) {
+        try {
+            Context ctx = sContext;
+            if (ctx == null || fileName == null || fileName.isEmpty()) return false;
+            File dir = new File(ctx.getCacheDir(), WorldFileProvider.PATH);
+            File file = new File(dir, fileName);
+            if (!file.isFile() || file.length() == 0) return false;
+
+            Uri uri = Uri.parse("content://" + WorldFileProvider.AUTHORITY + "/" +
+                    WorldFileProvider.PATH + "/" + Uri.encode(file.getName()));
+            Intent view = new Intent(Intent.ACTION_VIEW);
+            view.setDataAndType(uri, WorldFileProvider.MIME);
+            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Intent chooser = Intent.createChooser(view, "Open in Minecraft");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(chooser);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

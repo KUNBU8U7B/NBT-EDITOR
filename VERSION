@@ -7,5 +7,5 @@
 #   1.7.0 -> 1.7.1 -> ... -> 1.7.N (boleh sampai ribuan).
 # - JANGAN mengubah angka MINOR (kedua, saatnya 7) tanpa konfirmasi user.
 # - JANGAN naik ke 1.8.0 sebelum semua bug dinyatakan selesai oleh user.
-VERSION_CODE=27
-VERSION_NAME=1.7.6
+VERSION_CODE=31
+VERSION_NAME=1.7.10

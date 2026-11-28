@@ -20,6 +20,11 @@ public class MainActivity extends NativeActivity {
     /** Returns true when native code consumed BACK (drawer/dialog/editor/home). */
     public static native boolean onBackPressedNative();
 
+    /** Called from the native worker thread through ANativeActivity.clazz. */
+    public static boolean openInMinecraft(String fileName) {
+        return FilePickerActivity.openInMinecraft(fileName);
+    }
+
     @Override
     public void onBackPressed() {
         boolean handled = false;
@@ -34,5 +39,8 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Dibutuhkan FilePickerActivity.openInMinecraft() walau SAF picker
+        // belum pernah dibuka (misal langsung memilih "Open in Minecraft").
+        FilePickerActivity.sContext = getApplicationContext();
     }
 }

@@ -38,10 +38,17 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="application/octet-stream" />
-                <data android:mimeType="*/*" />
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+
+        <!-- Menyerahkan file .mcworld sementara (cache privat) ke Minecraft.
+             Tidak punya UI; hanya content Uri dengan izin baca sementara. -->
+        <provider
+            android:name="com.nbteditor.WorldFileProvider"
+            android:authorities="com.nbteditor.fileprovider"
+            android:exported="true"
+            android:grantUriPermissions="true" />
 
         <!-- SAF jembatan ke file manager bawaan OS. Tidak punya UI sendiri. -->
         <activity

@@ -9940,6 +9940,47 @@ AndroidX (appcompat, material3, cardview, recyclerview, drawerlayout, constraint
 > - Status bar: `kTopInset=24dp` ditambahkan ke `kBarH` (52→76dp) dan semua kontrol app bar + header drawer di-shift, sehingga judul tidak bertabrakan dengan jam/baterai.
 > - Verifikasi emulator v1.3.0: tap world → Options; Edit → peta tanpa aside; swipe horizontal `850→350` mengubah koordinat `(-16,32)` → `(0,32)`; swipe tepi kiri `150→620` memunculkan aside grup; 75/75 tes host lulus.
 
+### 17. Kompatibilitas perangkat Infinix / OEM (patch 1.7.9–1.7.10)
+Saat dipasang di **Infinix X6528B (Android 13, arm64-v8a)** aplikasi langsung crash dengan `java.lang.NoClassDefFoundError: Class not found using the boot class loader` tepat setelah log native `NBT Editor native app started`.
+
+Penyebab & perbaikan:
+1. **`FindClass` dari callback native** di ROM Transsion melempar `NoClassDefFoundError`; exception JNI tidak dibersihkan sehingga VM shutdown saat kembali ke Java. `initAppActivityClass()` kini memakai **`env->GetObjectClass(act->clazz)`** (catatan: `clazz` di `ANativeActivity` sebenarnya adalah *instance* Activity, bukan jclass) dan selalu `ExceptionClear()`.
+2. **`GetStaticMethodID`** di bridge share juga diberi pengecekan + clear exception.
+3. Setelah crash hilang, layar tetap **putih** karena ROM tidak mengirim callback fokus (`hasFocus` tetap false), sehingga `renderReady` tidak pernah aktif. Render sekarang bergantung hanya pada **`hasWindow`** (window ada → gambar), tidak pada fokus.
+
+**Verifikasi di Infinix:** v1.7.10 (code 31) terpasang, `am start` sukses, proses hidup, daftar world & app bar tampil benar; Show Map (world tanpa data chunk → checkerboard sesuai desain) dan dialog Map actions tampil tanpa crash. **64/64 + 77/77 tes host lulus.**
+
+### 16. Open in Minecraft dengan file sementara privat (patch 1.7.8)
+Permintaan: **"Open in Minecraft" tidak boleh membuat file `.mcworld` permanen di Download**.
+
+Implementasi:
+- Menu opsi world sekarang punya entri **Open in Minecraft** (`A_WORLD_OPEN_MINECRAFT`).
+- World di-zip oleh `app::createZip()` ke **`getCacheDir()/mcworld/<nama>.mcworld`** (storage privat aplikasi, bukan `/sdcard/Download`); file lama di folder itu dibersihkan setiap kali.
+- File dibagikan lewat `ACTION_VIEW` + content Uri `content://com.nbteditor.fileprovider/mcworld/<nama>` dengan `FLAG_GRANT_READ_URI_PERMISSION` dan `Intent.createChooser`. Penjelasan implementasi: `WorldFileProvider` (ContentProvider standar Android, tanpa androidx) hanya memberi akses **baca** ke file cache tersebut; `query()` mengembalikan nama & ukuran.
+- Jembatan JNI: class MainActivity dicache sebagai **global ref** di `onCreate` (`initAppActivityClass`). Worker **tidak** boleh memanggil JNI — percobaan awal crash di `GetStaticMethodID` (tombstone ART). Worker hanya menandai `pendingShareMcWorld`; hand-off JNI dilakukan di thread render pada frame berikutnya.
+- Filter `ACTION_VIEW` MainActivity dipangkas (menghapus `*/*`) agar aplikasi kita tidak muncul sebagai pilihan saat membagikan `.mcworld` ke Minecraft.
+
+**Verifikasi:** zip berhasil (`temp=/data/user/0/com.nbteditor/files/../cache/mcworld/H-S.mcworld`), chooser sistem muncul, **tidak ada file `.mcworld` baru di `/sdcard/Download`**, tidak ada tombstone/ANR dari `com.nbteditor`. **64/64 + 77/77 tes host lulus.**
+
+File baru: `app/java/com/nbteditor/WorldFileProvider.java`. Diubah: `AndroidManifest.xml`, `FilePickerActivity.java`, `MainActivity.java`, `main.native.cpp`, `VERSION`.
+
+### 15. Stabilitas aplikasi — mencegah dialog "aplikasi tidak merespon" (patch 1.7.7)
+
+**Penyebab utama (terkonfirmasi dari kode):** `drawMapView()` memanggil `decodeChunkTop()` **langsung di thread render**. Untuk ~350 chunk yang terlihat pada zoom 50%, tiap chunk melakukan `ldbGet` heightmap + 2 tetangga + subchunk, lalu parse palet NBT. Satu frame bisa memakan waktu sekian detik; karena event input di-`finish`-kan setelah render, InputDispatcher menganggap aplikasi macet → popup ANR.
+
+Perbaikan:
+1. **Prefetch chunk asinkron.** `drawMapView` kini hanya membaca warna dari `g_mapChunks` (di bawah `g_mapCacheMutex`); chunk belum siap digambar sebagai checkerboard murah dan dimasukkan ke `g_mapPending`. Worker `prefetchMapChunks()` memproses maksimal 6 chunk per job dengan cache subchunk milik worker sendiri (`g_mapSubs`, generation-guarded), lalu publish ke `g_mapChunks`.
+2. **Worker antrean (FIFO).** `Worker` dulu hanya punya 1 slot `job`; job scan entity langsung menimpa prefetch sehingga terrain tidak pernah decode. Sekarang `std::deque<std::function<void()>> jobs`, sehingga semua task background tetap jalan.
+3. **Input sebelum render.** `dispatchTouch()` / picker / BACK dipindah ke awal loop, sebelum `ANativeWindow_lock` + `renderFrame`. Frame lambat tidak lagi menunda pembalasan event.
+4. **Handle LevelDB aman thread.** `g_ldbMutex` menyerialisasi `ldbOpen/ldbClose/ldbGet/ldbPut/ldbIterate`; ganti world tidak bisa menutup DB saat worker masih membaca.
+5. **NBT besar di worker.** `A_NAV_LOCAL_PLAYER`/`OVERWORLD`/`AUTONOMOUS_ENTITIES` dll kini melakukan `ldbGet` + parse di worker, lalu publish `EditorState` di bawah `g_stateMutex`.
+6. **Join render thread bounded.** `onDestroy`/`bootstrap` tidak lagi `join()` tanpa batas di main thread; `joinRenderBounded()` menunggu maksimal 400ms lalu `detach()` bila perlu.
+7. **Pacing adaptif.** Frame >24ms diikuti sleep 33ms agar CPU tidak dilaparkan (membantu SystemUI di emulator lambat).
+
+**Verifikasi emulator:** startup `Displayed +585ms` (sebelum perbaikan +14s), peta tetap merender terrain asli setelah prefetch, tiga tap berturut-turut pada toolbar langsung tercatat di logcat, aside + scroll + buka NBT dari drawer berfungsi, **tidak ada `ANR in com.nbteditor` / "not responding"** di logcat. **64/64 + 77/77 tes host lulus.**
+
+> Catatan: popup "System UI isn't responding" yang sesekali muncul di emulator berasal dari `com.android.systemui` / `com.android.chrome` (proses sistem), bukan aplikasi; tidak dapat dihilangkan dari kode aplikasi.
+
 ### 14. Persistent background saat aside & scroll halus (patch 1.7.6)
 
 **Masalah 1 — background hitam saat aside dibuka.** Penyebabnya bukan scene di-reset: `buildMap()` sudah membangun scene lalu menumpuk `buildDrawer()` sebagai layer terakhir di pohon UI yang sama (`renderFrame` menggambar halaman sekali). Penyebab sebenarnya ada di rasteriser: `gfx::Canvas::fill/fillRectDev/roundRect/image` menulis `pack(Color)` **mentah** ke framebuffer `WINDOW_FORMAT_RGBA_8888` yang diperlakukan sebagai RGB opak. Scrim `rgba(0,0,0,0x50)` (sebelumnya `0x60`) dengan demikian menjadi **hitam solid**, menutup seluruh scene.

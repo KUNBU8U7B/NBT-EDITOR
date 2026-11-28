@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <string>
 #include <vector>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
@@ -2115,7 +2116,11 @@ struct Worker {
     std::thread th;
     std::mutex m;
     std::condition_variable cv;
-    std::function<void()> job;
+    // A single job slot silently dropped jobs: the entity-marker scan posted
+    // right after a map prefetch replaced it, so terrain never decoded.  A
+    // FIFO queue keeps every background task and bounds memory by coalescing
+    // duplicate prefetch requests at the call site.
+    std::deque<std::function<void()>> jobs;
     bool running = true, busy = false, done = false;
 
     void start() {
@@ -2124,17 +2129,17 @@ struct Worker {
         th = std::thread([this] {
             std::unique_lock<std::mutex> lk(m);
             while (running) {
-                cv.wait(lk, [this] { return job || !running; });
+                cv.wait(lk, [this] { return !jobs.empty() || !running; });
                 if (!running) return;
                 busy = true;
                 // run unlocked; callbacks post back through the UI queue (L0)
-                std::function<void()> run = job;
-                job = nullptr;
+                std::function<void()> run = std::move(jobs.front());
+                jobs.pop_front();
                 lk.unlock();
                 if (run) run();
                 lk.lock();
                 busy = false;
-                done = true;
+                done = jobs.empty();
                 cv.notify_all();
             }
         });
@@ -2142,7 +2147,7 @@ struct Worker {
     void post(std::function<void()> f) {
         {
             std::lock_guard<std::mutex> lk(m);
-            job = std::move(f);
+            jobs.push_back(std::move(f));
             done = false;
         }
         cv.notify_one();
@@ -2177,6 +2182,7 @@ enum Act {
     A_OPEN_NBT, A_NEW_NBT, A_WORLDS, A_RECENT_PICK,
     // worlds
     A_WORLD_DELETE, A_WORLD_EXPORT, A_WORLD_CREATE, A_WORLD_IMPORT,
+    A_WORLD_OPEN_MINECRAFT,
     A_WORLD_OPTIONS, A_WORLD_EDIT, A_FAB_TOGGLE,
     // browser
     A_BROWSE_UP, A_BROWSE_OPEN, A_FILE_SELECT,
@@ -2406,6 +2412,8 @@ struct AppState {
     bool mapEdgeSwipe = false;
     int64_t mapTapX = 0, mapTapZ = 0;
     std::vector<EntityChoice> entityChoices;   // entities in the tapped chunk
+    bool pendingShareMcWorld = false;          // set by worker, handled on render thread
+    std::string pendingShareName;
 };
 
 // ---- screen ids ------------------------------------------------------------
@@ -2490,6 +2498,10 @@ bool ldbReady() { return false; }
 bool ldbOpen(const std::string&) { return false; }
 void ldbClose() {}
 std::vector<uint8_t> ldbGet(const std::vector<uint8_t>&) { return {}; }
+// Host tests never launch Minecraft; stub the sharing bridge so handleAction
+// remains compilable without the Android platform glue.
+[[maybe_unused]] static bool shareMcWorldWithMinecraft(const std::string&) { return false; }
+static std::string mcWorldTempDir(const AppState&) { return {}; }
 #if NBT_TESTABLE
 // Test hook: records the last DB write so host tests can verify persistence.
 struct TestDbWrite { std::vector<uint8_t> key, value; };
@@ -3770,7 +3782,13 @@ inline gfx::Color fgFrom(const gfx::Theme& th) { return th.onSurface; }
 // one frame; it is never read outside the render thread.
 static AppState* g_renderState = nullptr;
 static std::unordered_map<uint64_t, std::vector<BlockColor>> g_mapChunks;
+// Subchunk cache is owned exclusively by the prefetch worker; the render
+// thread never touches it.  All hand-off goes through g_mapCacheMutex.
 static std::unordered_map<uint64_t, Subchunk> g_mapSubs;
+static std::mutex g_mapCacheMutex;
+static std::unordered_map<uint64_t, std::pair<int,int>> g_mapPending;
+static std::atomic<bool> g_mapPrefetchScheduled{false};
+static std::atomic<uint64_t> g_mapGeneration{0};
 
 // Entity markers from LevelDB "digp" keys (reference d0.e.b / s.a.c).
 using EntityMarker = EntityChoice;
@@ -3855,6 +3873,54 @@ static void loadMapMarkersAsync() {
     });
 }
 
+// Decode a few missing chunks per worker job.  The old code decoded chunks
+// inside drawMapView (render thread); LevelDB + NBT palette parsing stalled
+// input dispatch long enough to trigger the system ANR dialog.  Rendering now
+// only reads ready colours; missing chunks show the checkerboard until the
+// worker publishes them.
+static void clearMapCaches() {
+    std::lock_guard<std::mutex> lk(g_mapCacheMutex);
+    // g_mapSubs is worker-owned: never clear it from the render thread.
+    // The worker clears its own cache when the generation changes.
+    g_mapChunks.clear(); g_mapPending.clear();
+    g_mapGeneration.fetch_add(1);
+    g_mapPrefetchScheduled.store(false);
+}
+
+static void prefetchMapChunks() {
+    if (!ldbReady()) { g_mapPrefetchScheduled.store(false); return; }
+    static uint64_t seenGeneration = 0;   // worker thread only
+    const uint64_t gen = g_mapGeneration.load(std::memory_order_acquire);
+    if (gen != seenGeneration) {
+        g_mapSubs.clear();                // world changed: drop stale subchunks
+        seenGeneration = gen;
+    }
+    const int budget = 6;                 // bounded: keep the worker responsive
+    for (int i = 0; i < budget; ++i) {
+        uint64_t key = 0; int cx = 0, cz = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mapCacheMutex);
+            if (g_mapPending.empty()) break;
+            auto it = g_mapPending.begin();
+            key = it->first; cx = it->second.first; cz = it->second.second;
+            g_mapPending.erase(it);
+        }
+        auto colors = decodeChunkTop(cx, cz, &g_mapSubs);   // worker-owned cache
+        {
+            std::lock_guard<std::mutex> lk(g_mapCacheMutex);
+            g_mapChunks[key] = std::move(colors);
+            if (g_mapChunks.size() > 512) g_mapChunks.clear();
+        }
+    }
+    bool more;
+    {
+        std::lock_guard<std::mutex> lk(g_mapCacheMutex);
+        more = !g_mapPending.empty();
+        if (!more) g_mapPrefetchScheduled.store(false);
+    }
+    if (more) appWorker().post([]() { prefetchMapChunks(); });
+}
+
 inline void drawMapView(gfx::Canvas& c, AppState& a, Rect r) {
     const float bpd = 16.0f * a.mapScale;          // design px per block
     c.fill(r, gfx::rgb(0x44, 0x44, 0x44));
@@ -3867,15 +3933,32 @@ inline void drawMapView(gfx::Canvas& c, AppState& a, Rect r) {
         double bottom = a.mapCenterZ + (r.h / 2.0) / bpd;
         int c0 = (int)std::floor(left / 16), c1 = (int)std::floor(right / 16);
         int z0 = (int)std::floor(top / 16),  z1 = (int)std::floor(bottom / 16);
+        bool requested = false;
         for (int cz = z0; cz <= z1; ++cz) for (int cx = c0; cx <= c1; ++cx) {
             uint64_t key = ((uint64_t)(uint32_t)cx << 32) | (uint32_t)cz;
-            auto it = g_mapChunks.find(key);
-            if (it == g_mapChunks.end()) {
-                auto colors = decodeChunkTop(cx, cz, &g_mapSubs);
-                it = g_mapChunks.emplace(key, std::move(colors)).first;
-                if (g_mapChunks.size() > 512) g_mapChunks.clear();
+            std::vector<BlockColor> colors;
+            bool ready = false;
+            {
+                std::lock_guard<std::mutex> lk(g_mapCacheMutex);
+                auto it = g_mapChunks.find(key);
+                if (it != g_mapChunks.end()) { colors = it->second; ready = true; }
+                else if (g_mapPending.size() < 96) {
+                    g_mapPending[key] = {cx, cz};
+                    requested = true;
+                }
             }
-            const auto& colors = it->second;
+            if (!ready) {
+                // Cheap placeholder: no LevelDB work on the render thread.
+                for (int lz = 0; lz < 16; ++lz) for (int lx = 0; lx < 16; ++lx) {
+                    int px = r.x + (int)std::floor((cx * 16 + lx - left) * bpd);
+                    int py = r.y + (int)std::floor((cz * 16 + lz - top) * bpd);
+                    int pw = (int)std::ceil(bpd);
+                    if (px + pw < r.x || py + pw < r.y || px > r.right() || py > r.bottom()) continue;
+                    c.fill({px, py, pw, pw}, ((lx + lz) & 1) ? gfx::rgb(0x2e,0x2e,0x2e)
+                                                              : gfx::rgb(0x44,0x44,0x44));
+                }
+                continue;
+            }
             for (int lz = 0; lz < 16; ++lz) for (int lx = 0; lx < 16; ++lx) {
                 int bx = cx * 16 + lx, bz = cz * 16 + lz;
                 int px = r.x + (int)std::floor((bx - left) * bpd);
@@ -3901,6 +3984,8 @@ inline void drawMapView(gfx::Canvas& c, AppState& a, Rect r) {
                        gfx::rgb(0xff,0xff,0xff));
             }
         }
+        if (requested && !g_mapPrefetchScheduled.exchange(true))
+            appWorker().post([]() { prefetchMapChunks(); });
         // PNG mob/player icons from the XAPK assets (42 device px @ scale 1).
         loadMapMarkersAsync();
         std::vector<EntityMarker> markers;
@@ -4462,8 +4547,7 @@ void setScreen(AppState& a, int s) {
 void goHome(AppState& a) {
     if (a.screen == S_MAP) {
         ldbClose();
-        g_mapChunks.clear();
-        g_mapSubs.clear();
+        clearMapCaches();
         g_mapMarkers.clear();
         g_markersLoaded = false;
         g_markerCount.store(0);
@@ -5184,7 +5268,7 @@ static void enterWorldEditor(AppState& a, const WorldInfo& w) {
     a.mapSelection = false;
     ldbClose();
     ldbOpen(w.folder);
-    g_mapChunks.clear(); g_mapSubs.clear();
+    clearMapCaches();
     g_mapMarkers.clear(); g_markersLoaded = false; g_markerCount.store(0);
     setScreen(a, S_MAP);
     a.drawerOpen = false;         // user opens the aside by swiping (DrawerLayout)
@@ -5234,6 +5318,11 @@ static void startWorldImport(AppState& a, const std::string& src,
         } else pushToast(a, "Import failed: " + r.detail, a.theme.error);
     });
 }
+
+// Forward declarations for the private-cache "Open in Minecraft" bridge
+// (definitions live in the platform glue section).
+static bool shareMcWorldWithMinecraft(const std::string& fileName);
+static std::string mcWorldTempDir(const AppState& a);
 
 inline void handleAction(AppState& a, int act) {
     std::string err;
@@ -5415,21 +5504,28 @@ inline void handleAction(AppState& a, int act) {
                            "OK", A_NAV_CUSTOM, "CANCEL", A_DIALOG_NEG);
                 break;
             }
-            std::vector<uint8_t> dbkey(key, key + std::strlen(key));
-            std::vector<uint8_t> raw = ldbGet(dbkey);
-            if (raw.empty()) { pushToast(a, "No NBT data found.", a.theme.onSurfaceMuted); break; }
-            {
-                auto r = nbt::parseBytes(raw.data(), raw.size(), key, nbt::ParseOptions{});
-                if (!r.ok()) { pushToast(a, "No NBT data found.", a.theme.error); break; }
+            // AutonomousEntities / Overworld can be several MB.  Reading and
+            // parsing them inline stalled input dispatch; do it on the worker.
+            std::string dbkeyStr(key);
+            appWorker().post([&a, dbkeyStr]() {
+                std::vector<uint8_t> dbkey(dbkeyStr.begin(), dbkeyStr.end());
+                std::vector<uint8_t> raw = ldbGet(dbkey);
+                std::lock_guard<std::mutex> lk(g_stateMutex);
+                if (raw.empty()) {
+                    pushToast(a, "No NBT data found.", a.theme.onSurfaceMuted);
+                    return;
+                }
+                auto r = nbt::parseBytes(raw.data(), raw.size(), dbkeyStr, nbt::ParseOptions{});
+                if (!r.ok()) { pushToast(a, "No NBT data found.", a.theme.error); return; }
                 a.ed = EditorState{};
                 a.ed.doc = std::move(r.value);
-                a.ed.path = key;
+                a.ed.path = dbkeyStr;
                 a.ed.open = true;
                 a.ed.dbBacked = true;        // Save must use ldbPut(key), not a file
                 a.ed.dbKey = std::move(dbkey);
                 a.ed.pathIdx = {a.ed.doc.root};
                 setScreen(a, S_TREE);
-            }
+            });
             break; }
 
         case A_WORLD_EXPORT:
@@ -5454,6 +5550,44 @@ inline void handleAction(AppState& a, int act) {
                 });
             }
             break;
+        case A_WORLD_OPEN_MINECRAFT: {
+            // Reference "Open in Minecraft": zip into the app-private cache
+            // (NOT Download) and hand the content Uri to Minecraft. No permanent
+            // .mcworld is created by this action.
+            a.drawerOpen = false;
+            if (a.ed.selected >= 0 && a.ed.selected < (int)a.worlds.size()) {
+                auto& w = a.worlds[a.ed.selected];
+                std::string dir = mcWorldTempDir(a);
+                ensureDir(dir);
+                std::error_code ec;
+                for (fs::directory_iterator it(dir, ec), end; it != end; it.increment(ec))
+                    if (it->path().extension() == ".mcworld") fs::remove(it->path(), ec);
+                std::string temp = joinPath(dir, w.internalName + ".mcworld");
+                pushToast(a, "Compiling world...", a.theme.primary);
+                a.progressOpen = true;
+                a.progressTitle = "Compiling world...";
+                a.progressMsg = "Please wait while the world is being compiled. Do not exit the app.";
+                a.progressValue = 0.2f;
+                diagLog("openmc: temp=%s folder=%s", temp.c_str(), w.folder.c_str());
+                appWorker().post([&a, w, temp]() mutable {
+                    auto r = app::createZip(w.folder, temp);
+                    diagLog("openmc: zip ok=%d detail=%s", (int)r.ok(), r.detail.c_str());
+                    // JNI class lookup from a bare worker thread is unsafe
+                    // (ART class init crash). Queue the hand-off for the render
+                    // thread, which already uses JNI for SAF write-back.
+                    std::lock_guard<std::mutex> lk(g_stateMutex);
+                    a.progressValue = 1.0f;
+                    a.progressOpen = false;
+                    if (!r.ok()) {
+                        pushToast(a, "Export failed: " + r.detail, a.theme.error);
+                    } else {
+                        a.pendingShareMcWorld = true;
+                        a.pendingShareName = baseName(temp);
+                        pushToast(a, "Compiled world — opening…", a.theme.primary);
+                    }
+                });
+            }
+            break; }
         case A_TOGGLE_THEME:
             a.dark = !a.dark;
             a.theme = a.dark ? gfx::themeDark() : gfx::themeLight();
@@ -5595,6 +5729,7 @@ inline void handleAction(AppState& a, int act) {
                 a.menuItems = {
                     {"Edit", A_WORLD_EDIT},
                     {"Export .mcworld", A_WORLD_EXPORT},
+                    {"Open in Minecraft", A_WORLD_OPEN_MINECRAFT},
                     {"Delete World", A_WORLD_DELETE},
                     {"CLOSE", A_MENU_CLOSE},
                 };
@@ -6026,6 +6161,8 @@ inline void handleAction(AppState& a, int act) {
                     }
                 } else if (chosen == A_WORLD_EXPORT) {
                     handleAction(a, A_WORLD_EXPORT);
+                } else if (chosen == A_WORLD_OPEN_MINECRAFT) {
+                    handleAction(a, A_WORLD_OPEN_MINECRAFT);
                 } else if (chosen == A_WORLD_DELETE) {
                     int idx = a.dialogTargetIndex;
                     if (idx < 0 || idx >= (int)a.worlds.size()) idx = a.ed.selected;
@@ -6196,6 +6333,24 @@ struct Platform {
 
 static std::mutex g_platMutex;               // queue/window hand-off only
 static std::thread g_renderThread;           // joinable, restarted per activity
+static std::atomic<bool> g_renderExited{false};
+
+// Lifecycle callbacks run on Android's main thread.  Joining the render thread
+// unconditionally there can block >5 s and produce an ANR of its own.  Wait a
+// bounded time for the thread to signal its own exit, then detach instead.
+static void joinRenderBounded() {
+    if (!g_renderThread.joinable()) return;
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::milliseconds(400);
+    while (!g_renderExited.load(std::memory_order_acquire) && clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (g_renderExited.load(std::memory_order_acquire)) {
+        g_renderThread.join();
+    } else {
+        // The thread owns only process-lifetime globals; detaching is safe.
+        g_renderThread.detach();
+    }
+}
 
 // The UI is designed for ~360 design units (dp) across. On a 1080p phone the
 // density is 3, so one design unit must become three device pixels; without
@@ -6323,7 +6478,7 @@ static void attachInputIfNeeded() {
 static void onStart(ANativeActivity*) { g_plat.paused = false; wakeRender(); }
 static void onResume(ANativeActivity*) {
     g_plat.paused = false;
-    g_plat.renderReady = g_plat.hasFocus.load() && g_plat.hasWindow.load();
+    g_plat.renderReady = g_plat.hasWindow.load();
     wakeRender();
 }
 static void* onSaveInstanceState(ANativeActivity*, size_t*) { return nullptr; }
@@ -6346,10 +6501,8 @@ static void onDestroy(ANativeActivity*) {
     // The render thread is now joinable and polls with a finite timeout.  Join
     // it on the Android main thread before the activity state disappears; this
     // is bounded because no ALooper_pollOnce(-1) and no worker join remain.
-    if (g_renderThread.joinable()) {
-        g_renderThread.join();
-        diagLog("shutdown: render thread joined");
-    }
+    joinRenderBounded();
+    diagLog("shutdown: render thread joined/detached");
     g_plat.activity.store(nullptr);
     diagLog("shutdown: activity destroyed");
 }
@@ -6381,7 +6534,7 @@ static void onNativeWindowCreated(ANativeActivity*, ANativeWindow* w) {
     g_plat.scale = uiScaleFor(width, height);
     ANativeWindow_setBuffersGeometry(w, width, height, WINDOW_FORMAT_RGBA_8888);
     g_plat.hasWindow = true;
-    g_plat.renderReady = g_plat.hasFocus.load();
+    g_plat.renderReady = g_plat.hasWindow.load();
     wakeRender();
 }
 static void onNativeWindowResized(ANativeActivity*, ANativeWindow* w) {
@@ -6393,11 +6546,11 @@ static void onNativeWindowResized(ANativeActivity*, ANativeWindow* w) {
     g_plat.height = height;
     g_plat.scale = uiScaleFor(width, height);
     ANativeWindow_setBuffersGeometry(w, width, height, WINDOW_FORMAT_RGBA_8888);
-    g_plat.renderReady = g_plat.hasFocus.load() && g_plat.hasWindow.load();
+    g_plat.renderReady = g_plat.hasWindow.load();
     wakeRender();
 }
 static void onNativeWindowRedrawNeeded(ANativeActivity*, ANativeWindow*) {
-    g_plat.renderReady = g_plat.hasFocus.load() && g_plat.hasWindow.load();
+    g_plat.renderReady = g_plat.hasWindow.load();
     wakeRender();
 }
 static void onNativeWindowDestroyed(ANativeActivity*, ANativeWindow*) {
@@ -6628,6 +6781,65 @@ bool writePickedFile(const std::string& uri, const std::vector<uint8_t>& bytes) 
     return ok;
 }
 
+// Class lookup must happen on the JVM-attached main thread during onCreate;
+// attached native threads cannot resolve app classes reliably and ART crashes
+// inside GetStaticMethodID when handed a stale/borrowed jclass.
+static jclass g_appActivityClass = nullptr;
+
+static void initAppActivityClass(ANativeActivity* act) {
+    // ANativeActivity.clazz is the live NativeActivity *instance* (despite the
+    // misleading name). GetObjectClass on it needs no class-loader lookup.
+    if (g_appActivityClass || !act || !act->vm || !act->clazz) return;
+    JNIEnv* env = nullptr;
+    if (act->vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
+    // Some OEM ROMs (Infinix/Transsion) make FindClass from the native
+    // callback throw NoClassDefFoundError, which then kills the VM on return.
+    jclass local = env->GetObjectClass(act->clazz);
+    if (local && !env->ExceptionCheck()) {
+        g_appActivityClass = (jclass)env->NewGlobalRef(local);
+        env->DeleteLocalRef(local);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+// Hand a temporary .mcworld in the app-private cache to Minecraft via the
+// Java FileProvider bridge.  No file is written to the shared Download folder.
+static bool shareMcWorldWithMinecraft(const std::string& fileName) {
+    ANativeActivity* act = g_plat.activity.load(std::memory_order_acquire);
+    if (!act || !act->vm || fileName.empty()) return false;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint rc = act->vm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (rc == JNI_EDETACHED) {
+        if (act->vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return false;
+        attached = true;
+    } else if (rc != JNI_OK) return false;
+    bool ok = false;
+    do {
+        // Called on the render thread, which already resolves app classes for
+        // SAF write-back. Never call this from the bare worker thread.
+        jclass cls = g_appActivityClass;   // global ref created on main thread
+        if (!cls) break;
+        jmethodID m = env->GetStaticMethodID(cls, "openInMinecraft",
+                                             "(Ljava/lang/String;)Z");
+        if (env->ExceptionCheck()) { env->ExceptionClear(); m = nullptr; }
+        if (!m) break;
+        jstring jn = env->NewStringUTF(fileName.c_str());
+        ok = env->CallStaticBooleanMethod(cls, m, jn) == JNI_TRUE;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); ok = false; }
+        env->DeleteLocalRef(jn);
+    } while (false);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) act->vm->DetachCurrentThread();
+    return ok;
+}
+
+// getCacheDir()/mcworld is the app-private cache; internalDataPath points at
+// <app>/files, so ../cache reaches the same directory Java uses.
+static std::string mcWorldTempDir(const AppState& a) {
+    return joinPath(joinPath(a.filesDir, ".."), "cache/mcworld");
+}
+
 // Called on the render thread (under g_stateMutex) right after dispatchTouch.
 static void dispatchPickerResult(AppState& a) {
     PickedFile r;
@@ -6724,9 +6936,15 @@ static std::vector<uint8_t> jniToBytes(JNIEnv* env, jbyteArray a) {
 }
 } // namespace ldb
 
-bool ldbReady() { return ldb::handle != 0; }
+// The LevelDB handle is shared by the render thread and the prefetch/marker
+// workers.  Serialise handle access so a world switch cannot close the DB
+// while a worker is reading it (use-after-free / JNI crash / ANR).
+static std::mutex g_ldbMutex;
+
+bool ldbReady() { std::lock_guard<std::mutex> lk(g_ldbMutex); return ldb::handle != 0; }
 
 bool ldbOpen(const std::string& worldFolder) {
+    std::lock_guard<std::mutex> lk(g_ldbMutex);
     if (ldb::handle) return true;
     if (!ldb::ensureLib()) return false;
     JNIEnv* env = ldb::currentEnv();
@@ -6741,6 +6959,7 @@ bool ldbOpen(const std::string& worldFolder) {
 }
 
 void ldbClose() {
+    std::lock_guard<std::mutex> lk(g_ldbMutex);
     JNIEnv* env = ldb::currentEnv();
     if (ldb::handle && ldb::fnClose && env) {
         ldb::fnClose(env, nullptr, ldb::handle);
@@ -6750,6 +6969,7 @@ void ldbClose() {
 }
 
 std::vector<uint8_t> ldbGet(const std::vector<uint8_t>& key) {
+    std::lock_guard<std::mutex> lk(g_ldbMutex);
     JNIEnv* env = ldb::currentEnv();
     if (!ldb::handle || !env || !ldb::fnGet) return {};
     // Local frame keeps the 40k-key iteration from overflowing JNI local refs.
@@ -6763,6 +6983,7 @@ std::vector<uint8_t> ldbGet(const std::vector<uint8_t>& key) {
 }
 
 bool ldbPut(const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) {
+    std::lock_guard<std::mutex> lk(g_ldbMutex);
     JNIEnv* env = ldb::currentEnv();
     if (!ldb::handle || !env || !ldb::fnPut) return false;
     env->PushLocalFrame(8);
@@ -6776,6 +6997,7 @@ bool ldbPut(const std::vector<uint8_t>& key, const std::vector<uint8_t>& value) 
 }
 
 std::vector<std::vector<uint8_t>> ldbIterate(const std::vector<uint8_t>& prefix) {
+    std::lock_guard<std::mutex> lk(g_ldbMutex);
     std::vector<std::vector<uint8_t>> out;
     JNIEnv* env = ldb::currentEnv();
     if (!ldb::handle || !env || !ldb::fnIter) return out;
@@ -6976,6 +7198,7 @@ static void dispatchTouch(AppState& a) {
 
 // ---- the render thread ------------------------------------------------------
 static void androidMain() {
+    g_renderExited.store(false, std::memory_order_release);
     diagLog("render: thread started");
 
     // A fresh std::thread does not have an ALooper.  ALooper_prepare(0) makes
@@ -7003,6 +7226,51 @@ static void androidMain() {
         // Every poll is finite.  A negative timeout was the reason the queue
         // could be created while the render thread never returned to attach it.
         if (looper) ALooper_pollOnce(0, nullptr, nullptr, nullptr);
+
+        // Input is dispatched BEFORE rendering.  A slow frame (first map
+        // tiles, big NBT parse) must never delay finishing input events —
+        // that stall is what makes Android show "app isn't responding".
+        AppState& a = g_state;
+        {
+            std::lock_guard<std::mutex> lk(g_platMutex);
+            a.scale = g_plat.scale.load(std::memory_order_relaxed) > 0
+                      ? g_plat.scale.load(std::memory_order_relaxed) : 1;
+            a.w = std::max(1, g_plat.width.load(std::memory_order_relaxed) / a.scale);
+            a.h = std::max(1, g_plat.height.load(std::memory_order_relaxed) / a.scale);
+        }
+        a.nowMs = nowMs();
+        bool exitRequested = false;
+        {
+            std::lock_guard<std::mutex> lk(g_stateMutex);
+            dispatchTouch(a);
+            dispatchPickerResult(a);   // SAF / OS file manager callback
+            if (g_backRequested.exchange(false, std::memory_order_acq_rel)) back(a);
+            exitRequested = a.wantExit;
+            if (exitRequested) a.wantExit = false;
+        }
+        if (exitRequested) {
+            ANativeActivity* act = g_plat.activity.load(std::memory_order_acquire);
+            if (act) ANativeActivity_finish(act);
+            break;
+        }
+
+        // Hand the temporary .mcworld to Minecraft from this thread (JNI from
+        // the bare worker thread crashed inside ART's GetStaticMethodID).
+        bool shareNow = false;
+        std::string shareName;
+        {
+            std::lock_guard<std::mutex> lk(g_stateMutex);
+            if (a.pendingShareMcWorld) {
+                a.pendingShareMcWorld = false;
+                shareName = a.pendingShareName;
+                a.pendingShareName.clear();
+                shareNow = true;
+            }
+        }
+        if (shareNow && !shareMcWorldWithMinecraft(shareName)) {
+            std::lock_guard<std::mutex> lk(g_stateMutex);
+            pushToast(a, "No app found to open .mcworld", a.theme.error);
+        }
 
         if (!g_plat.renderReady.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -7034,12 +7302,7 @@ static void androidMain() {
             ANativeWindow_setBuffersGeometry(w, width, height, WINDOW_FORMAT_RGBA_8888);
         }
 
-        AppState& a = g_state;
-        a.nowMs = nowMs();
-        a.scale = scale > 0 ? scale : 1;
-        a.w = std::max(1, width / a.scale);
-        a.h = std::max(1, height / a.scale);
-
+        // a.scale / a.w / a.h were refreshed from the platform state above.
         ANativeWindow_Buffer buf;
         if (ANativeWindow_lock(w, &buf, nullptr) < 0) {
             ANativeWindow_release(w);
@@ -7063,21 +7326,10 @@ static void androidMain() {
         ++frames;
         if (frames == 1) diagLog("render: first frame drawn %dx%d", a.w, a.h);
 
-        bool exitRequested = false;
-        {
-            std::lock_guard<std::mutex> lk(g_stateMutex);
-            dispatchTouch(a);
-            dispatchPickerResult(a);   // SAF / OS file manager callback
-            if (g_backRequested.exchange(false, std::memory_order_acq_rel)) back(a);
-            exitRequested = a.wantExit;
-            if (exitRequested) a.wantExit = false;
-        }
-        if (exitRequested) {
-            ANativeActivity* act = g_plat.activity.load(std::memory_order_acquire);
-            if (act) ANativeActivity_finish(act);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));   // ~60fps
+        // Yield the CPU after an expensive frame so the compositor / SystemUI
+        // (and other processes on a slow device) are never starved.
+        int64_t frameMs = nowMs() - a.nowMs;
+        std::this_thread::sleep_for(std::chrono::milliseconds(frameMs > 24 ? 33 : 16));
     }
 
     {
@@ -7090,6 +7342,7 @@ static void androidMain() {
             g_plat.looper.store(nullptr, std::memory_order_release);
         }
     }
+    g_renderExited.store(true, std::memory_order_release);
     diagLog("render: thread exiting");
 }
 
@@ -7097,7 +7350,7 @@ static void bootstrap(ANativeActivity* activity) {
     // Activity recreation must not race the previous render thread while it is
     // still reading AppState.  onDestroy() normally joins already; this is the
     // defensive fallback for a lifecycle callback that arrived out of order.
-    if (g_renderThread.joinable()) g_renderThread.join();
+    joinRenderBounded();
     g_plat.activity.store(activity, std::memory_order_release);
     g_plat.running = true;
     g_plat.paused = false;
@@ -7163,6 +7416,7 @@ static void bootstrap(ANativeActivity* activity) {
 extern "C" NBT_EXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* savedState,
                                                    size_t savedStateSize) {
     (void)savedState; (void)savedStateSize;
+    app::initAppActivityClass(activity);   // cache app class for the JNI share bridge
     ANativeActivityCallbacks* cb = activity->callbacks;
     cb->onStart = app::onStart;
     cb->onResume = app::onResume;
@@ -8032,7 +8286,7 @@ static ui::Node buildKeypadResult(AppState& a) {
             bool finished = false;
             {   // peek without holding the lock while sleeping
                 std::lock_guard<std::mutex> lk(w.m);
-                finished = (w.done && !w.job);
+                finished = (w.done && w.jobs.empty());
             }
             if (finished) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -8071,7 +8325,7 @@ static ui::Node buildKeypadResult(AppState& a) {
         app::Worker& w = app::appWorker();
         for (int k = 0; k < 600; ++k) {
             bool finished = false;
-            { std::lock_guard<std::mutex> lk(w.m); finished = (w.done && !w.job); }
+            { std::lock_guard<std::mutex> lk(w.m); finished = (w.done && w.jobs.empty()); }
             if (finished) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
